@@ -1,13 +1,33 @@
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET, POST, OPTIONS, HEAD",
-  "Access-Control-Allow-Headers": "*",
-  "Access-Control-Expose-Headers": "Content-Length, Content-Range",
+  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+  "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type, range, x-supabase-client-platform, x-supabase-client-platform-version, x-supabase-client-runtime, x-supabase-client-runtime-version",
+  "Access-Control-Expose-Headers": "Content-Length, Content-Range, Content-Type",
 };
 
-const DEFAULT_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+const DEFAULT_UA =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+const MAX_REDIRECTS = 5;
 
-function extraParams(params: URLSearchParams): string {
+function buildUpstreamHeaders(req, params) {
+  const headers = {
+    "User-Agent": params.get("ua") || DEFAULT_UA,
+  };
+  const referer = params.get("referer");
+  if (referer) {
+    headers["Referer"] = referer;
+    try { headers["Origin"] = new URL(referer).origin; } catch {}
+  }
+  const cookie = params.get("cookie");
+  if (cookie) headers["Cookie"] = cookie;
+  const auth = params.get("auth");
+  if (auth) headers["Authorization"] = auth;
+  const range = req.headers.get("Range");
+  if (range) headers["Range"] = range;
+  return headers;
+}
+
+function extraParams(params) {
   let extra = "";
   for (const key of ["ua", "referer", "cookie", "auth"]) {
     const val = params.get(key);
@@ -16,21 +36,23 @@ function extraParams(params: URLSearchParams): string {
   return extra;
 }
 
-function rewriteDASH(text: string, baseUrl: string, proxyBase: string, extra: string): string {
-  let rewritten = text;
-  rewritten = rewritten.replace(/<BaseURL>([^<]+)<\/BaseURL>/g, (_m, innerUrl) => {
-    const full = innerUrl.startsWith("http") ? innerUrl : baseUrl + innerUrl;
-    return `<BaseURL>${proxyBase}${encodeURIComponent(full)}${extra}</BaseURL>`;
-  });
-  rewritten = rewritten.replace(/(media|initialization)="([^"]+)"/g, (match, attr, val) => {
-    if (val.includes("$")) return match;
-    const full = val.startsWith("http") ? val : baseUrl + val;
-    return `${attr}="${proxyBase}${encodeURIComponent(full)}${extra}"`;
-  });
-  return rewritten;
+async function fetchWithRedirects(url, headers, method = "GET", body = null) {
+  let current = url;
+  for (let i = 0; i < MAX_REDIRECTS; i++) {
+    const init = { method, headers, redirect: "manual" };
+    if (i === 0 && body && method === "POST") init.body = body;
+    const resp = await fetch(current, init);
+    const location = resp.headers.get("location");
+    if (location && resp.status >= 300 && resp.status < 400) {
+      current = location.startsWith("http") ? location : new URL(location, current).toString();
+      continue;
+    }
+    return resp;
+  }
+  return await fetch(current, { method, headers });
 }
 
-function rewriteHLS(text: string, baseUrl: string, proxyBase: string, extra: string): string {
+function rewriteHLS(text, baseUrl, proxyBase, extra) {
   return text.split("\n").map((line) => {
     const trimmed = line.trim();
     if (trimmed.includes('URI="')) {
@@ -47,57 +69,88 @@ function rewriteHLS(text: string, baseUrl: string, proxyBase: string, extra: str
   }).join("\n");
 }
 
-const port = Number(Deno.env.get("PORT")) || 8080;
+function rewriteDASH(text, baseUrl, proxyBase, extra) {
+  let rewritten = text;
+  rewritten = rewritten.replace(/<BaseURL>([^<]+)<\/BaseURL>/g, (_m, innerUrl) => {
+    const full = innerUrl.startsWith("http") ? innerUrl : baseUrl + innerUrl;
+    return `<BaseURL>${proxyBase}${encodeURIComponent(full)}${extra}</BaseURL>`;
+  });
+  rewritten = rewritten.replace(/(media|initialization)="([^"]+)"/g, (match, attr, val) => {
+    if (val.includes("$")) return match;
+    const full = val.startsWith("http") ? val : baseUrl + val;
+    return `${attr}="${proxyBase}${encodeURIComponent(full)}${extra}"`;
+  });
+  return rewritten;
+}
 
-Deno.serve({ port, hostname: "0.0.0.0" }, async (req) => {
-  if (req.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
+export default {
+  async fetch(request, env, ctx) {
+    if (request.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
+    try {
+      const url = new URL(request.url);
+      const params = url.searchParams;
+      const targetUrl = params.get("url");
 
-  try {
-    const url = new URL(req.url);
-    const targetUrl = url.searchParams.get("url");
+      if (!targetUrl) {
+        return new Response(JSON.stringify({ error: "Missing 'url' parameter" }), {
+          status: 400,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
 
-    if (!targetUrl) {
-      return new Response("Proxy is running. Use ?url=YOUR_URL", { status: 200, headers: corsHeaders });
-    }
+      const upstreamHeaders = buildUpstreamHeaders(request, params);
 
-    const upstreamHeaders = new Headers();
-    upstreamHeaders.set("User-Agent", url.searchParams.get("ua") || DEFAULT_UA);
-    const range = req.headers.get("range");
-    if (range) upstreamHeaders.set("range", range);
+      if (request.method === "POST") {
+        const reqBody = await request.arrayBuffer();
+        const clientCT = request.headers.get("content-type");
+        if (clientCT) upstreamHeaders["Content-Type"] = clientCT;
+        const resp = await fetchWithRedirects(targetUrl, upstreamHeaders, "POST", reqBody);
+        const respBody = await resp.arrayBuffer();
+        const respCT = resp.headers.get("content-type") || "application/octet-stream";
+        return new Response(respBody, {
+          status: resp.status,
+          headers: { ...corsHeaders, "Content-Type": respCT },
+        });
+      }
 
-    const response = await fetch(targetUrl, {
-      method: req.method,
-      headers: upstreamHeaders,
-    });
+      const response = await fetchWithRedirects(targetUrl, upstreamHeaders, "GET");
+      if (!response.ok && response.status !== 206) {
+        return new Response(JSON.stringify({ error: `Upstream ${response.status}` }), {
+          status: response.status,
+          headers: { ...corsHeaders, "Content-Type": "application/json" },
+        });
+      }
 
-    const contentType = response.headers.get("content-type") || "";
+      const contentType = response.headers.get("content-type") || "application/octet-stream";
+      const body = await response.arrayBuffer();
+      const isHLS = targetUrl.includes(".m3u8") || contentType.includes("mpegurl");
+      const isDASH = targetUrl.includes(".mpd") || contentType.includes("dash+xml");
 
-    if (targetUrl.includes(".mpd") || targetUrl.includes(".m3u8") || contentType.includes("mpegurl") || contentType.includes("dash+xml")) {
-      const text = await response.text();
-      const baseUrl = targetUrl.substring(0, targetUrl.lastIndexOf("/") + 1);
-      const proxyBase = `${url.origin}${url.pathname}?url=`;
-      const extra = extraParams(url.searchParams);
-      
-      const rewritten = (targetUrl.includes(".mpd") || contentType.includes("dash+xml"))
-        ? rewriteDASH(text, baseUrl, proxyBase, extra)
-        : rewriteHLS(text, baseUrl, proxyBase, extra);
+      if (isHLS || isDASH) {
+        const text = new TextDecoder().decode(body);
+        const baseUrl = targetUrl.substring(0, targetUrl.lastIndexOf("/") + 1);
+        const proxyBase = `${url.origin}${url.pathname}?url=`;
+        const extra = extraParams(params);
+        const rewritten = isHLS ? rewriteHLS(text, baseUrl, proxyBase, extra) : rewriteDASH(text, baseUrl, proxyBase, extra);
+        return new Response(rewritten, {
+          status: response.status,
+          headers: { ...corsHeaders, "Content-Type": isHLS ? "application/vnd.apple.mpegurl" : "application/dash+xml", "Cache-Control": "no-cache" },
+        });
+      }
 
-      return new Response(rewritten, {
-        headers: { ...corsHeaders, "Content-Type": contentType, "Cache-Control": "no-cache" }
+      const respHeaders = { ...corsHeaders, "Content-Type": contentType };
+      const cl = response.headers.get("content-length");
+      if (cl) respHeaders["Content-Length"] = cl;
+      const cr = response.headers.get("content-range");
+      if (cr) respHeaders["Content-Range"] = cr;
+
+      return new Response(body, { status: response.status, headers: respHeaders });
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : "Unknown error";
+      return new Response(JSON.stringify({ error: msg }), {
+        status: 500,
+        headers: { ...corsHeaders, "Content-Type": "application/json" },
       });
     }
-
-    const outHeaders = new Headers(corsHeaders);
-    if (contentType) outHeaders.set("Content-Type", contentType);
-    if (response.headers.get("content-length")) outHeaders.set("Content-Length", response.headers.get("content-length")!);
-    if (response.headers.get("content-range")) outHeaders.set("Content-Range", response.headers.get("content-range")!);
-
-    return new Response(response.body, {
-      status: response.status,
-      headers: outHeaders
-    });
-
-  } catch (error) {
-    return new Response(error.message, { status: 500, headers: corsHeaders });
   }
-});
+};
